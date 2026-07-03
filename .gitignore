@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Candidate data — never commit resumes or scored output (PII)
+resumes/
+*.xlsx
+screen_checkpoint.csv
+test.xlsx
