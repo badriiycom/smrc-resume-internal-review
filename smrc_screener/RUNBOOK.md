@@ -1,8 +1,10 @@
 # SMRC KP Resume Screener — Runbook
 
 **Audience:** Badri / IT (whoever runs the script). No prior familiarity with the
-SMRC capture needed. Estimated setup time: ~30 min. Full 580-resume run: roughly
-1–2 hours unattended, depending on rate limits.
+SMRC capture needed. Estimated setup time: ~30 min. Full 580-resume run: in
+batch mode (recommended), usually well under an hour, with a 24-hour ceiling
+per Anthropic's SLA; in live mode, roughly 1–2 hours unattended depending on
+rate limits.
 
 **What it does:** Reads every resume in a folder, sends each to Claude via the
 Anthropic API, scores it against all eight SMRC Key Personnel checklists in one
@@ -25,6 +27,30 @@ whether they meet minimum SOW requirements, why, multi-role flags, OCI flags).
   downloading. Point the script at that local folder.
 - **(Optional) LibreOffice** on PATH — only needed if you have legacy `.doc` or
   `.rtf` resumes. `.pdf`, `.docx`, and `.txt` work without it.
+
+### No admin rights on your Windows machine?
+
+You don't need an installer. Use the official "embeddable package":
+
+1. Download the **Windows embeddable package (64-bit)** zip for a current
+   Python 3.x release from https://www.python.org/downloads/windows/ (scroll
+   to "Looking for a specific release?" if needed — pick the same major
+   version, e.g. 3.12).
+2. Extract it to a folder you own, e.g.
+   `C:\Users\<you>\Documents\python-embed\`. No installer runs, no admin
+   prompt.
+3. The embeddable package ships without `pip`. Bootstrap it:
+   - Download https://bootstrap.pypa.io/get-pip.py into that same folder.
+   - Open the extracted folder's `python3XX._pth` file (e.g. `python312._pth`)
+     and uncomment the line `#import site` (remove the `#`) — this is required
+     for `pip` and installed packages to be importable.
+   - Run `python.exe get-pip.py` from that folder.
+4. From then on, use the full path to that `python.exe` (or add the folder to
+   your user `PATH`) everywhere this runbook says `python`, e.g.:
+   ```powershell
+   C:\Users\<you>\Documents\python-embed\python.exe -m pip install -r requirements.txt
+   C:\Users\<you>\Documents\python-embed\python.exe smrc_screen.py --input "..." --mode batch
+   ```
 
 ## 2. Install
 
@@ -55,15 +81,44 @@ categories look right, proceed to the full run.
 
 ## 5. Full run
 
+Two modes — pick one:
+
+**Batch mode (recommended for a full 580-resume run):** submits everything as
+a single Anthropic Message Batch, ~50% cheaper than live calls. Anthropic's
+SLA is "within 24 hours," but a batch this size usually finishes in well under
+an hour.
+
 ```bash
-python smrc_screen.py --input "C:\path\to\resumes" --out SMRC_Resume_Triage_Tracker.xlsx --batch full-run
+python smrc_screen.py --input "C:\path\to\resumes" --out SMRC_Resume_Triage_Tracker.xlsx --mode batch --label full-run
+```
+
+- Prints a submission confirmation with a batch ID, then polls status every
+  30s (`--poll-interval` to change) until it's done, printing progress each
+  time (`succeeded=... errored=... processing=...`).
+- Safe to interrupt (Ctrl+C, closed terminal, laptop sleep). Just re-run the
+  **exact same command** — it reads `batch_state.json`, sees the batch is
+  already submitted, and resumes polling instead of resubmitting (no
+  duplicate charges).
+- Don't want to leave the terminal open? Add `--no-wait`: it checks status
+  once and exits either way. Re-run the same command whenever you want to
+  check again or to collect results once it's done.
+- Once the batch reaches `ended`, results are written to
+  `screen_checkpoint.csv` and the `.xlsx` in the same run.
+
+**Live mode:** one call per resume, sequentially — simpler mental model,
+slightly more expensive, and you see results land one at a time.
+
+```bash
+python smrc_screen.py --input "C:\path\to\resumes" --out SMRC_Resume_Triage_Tracker.xlsx --mode live --label full-run
 ```
 
 - Progress prints per file: `[42/580] jsmith_resume.pdf`.
 - Every result is also appended to `screen_checkpoint.csv` as it goes.
 - **Interrupted?** Just re-run the exact same command. It reads the checkpoint
   and skips everything already done — no duplicate API charges, no lost work.
-- To force a clean re-run, delete `screen_checkpoint.csv` first.
+
+Both modes: to force a clean re-run, delete `screen_checkpoint.csv` (and, for
+batch mode, `batch_state.json`) first.
 
 ## 6. Output
 
@@ -118,12 +173,18 @@ needs to change.
   `--model` if needed).
 - ~580 resumes × one call each. Cost depends on resume length; the script caps
   each resume at ~24k characters to keep it bounded. Ballpark: low tens of
-  dollars total, not hundreds. Check current pricing in the Anthropic Console.
-- `--sleep 0.5` adds a half-second between calls as a rate-limit cushion. If you
-  hit rate-limit errors, raise it (e.g. `--sleep 1.5`). Errors on individual
-  files are logged in the `error` column of the checkpoint/tracker and can be
-  re-run (delete that row from `screen_checkpoint.csv` and re-run the same
-  command).
+  dollars total in live mode, roughly half that in batch mode. Check current
+  pricing in the Anthropic Console.
+- **Batch mode** has no per-call rate-limit concerns to manage — Anthropic
+  processes the whole batch on their side. `--poll-interval` only controls how
+  often this script checks in, not how fast the batch itself runs.
+- **Live mode**: `--sleep 0.5` adds a half-second between calls as a
+  rate-limit cushion. If you hit rate-limit errors, raise it (e.g.
+  `--sleep 1.5`).
+- Either mode: errors on individual resumes (extraction failures, malformed
+  model output, etc.) are logged in the `error` column of the
+  checkpoint/tracker rather than stopping the run. To retry just those, delete
+  their rows from `screen_checkpoint.csv` and re-run the same command.
 
 ## Files in this package
 

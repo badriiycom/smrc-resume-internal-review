@@ -16,8 +16,8 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 # Test run against a synced local copy of the resume folder
 python smrc_screen.py --input "/path/to/BD Resumes Active" --limit 5 --out test.xlsx
 
-# Full run
-python smrc_screen.py --input "/path/to/BD Resumes Active" --out SMRC_Resume_Triage_Tracker.xlsx --batch full-run
+# Full run — batch mode: ~50% cheaper, submits all resumes as one async job
+python smrc_screen.py --input "/path/to/BD Resumes Active" --out SMRC_Resume_Triage_Tracker.xlsx --mode batch --label full-run
 ```
 
 The script never talks to SharePoint directly — sync or download the "BD
@@ -25,6 +25,8 @@ Resumes Active" library to local disk first (see the runbook). It never
 uploads resumes anywhere; each resume is sent only to the Anthropic API for
 scoring, and results land in a local Excel tracker plus a CSV checkpoint that
 lets you stop and resume a long run without re-billing or losing progress.
+No admin rights on your machine to install Python? See the runbook's
+no-install setup using the Python embeddable package.
 
 Resumes, the checkpoint CSV, and the output `.xlsx` are excluded from git via
 `.gitignore` — this repo holds the tool, not candidate data.

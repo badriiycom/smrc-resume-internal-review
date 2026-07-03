@@ -4,11 +4,22 @@
 Reads every resume in a folder, sends each to Claude, scores it against all
 eight SMRC Key Personnel checklists in one pass, and writes a branded Excel
 tracker. See RUNBOOK.md for setup and usage.
+
+Two modes:
+  --mode live  (default) One API call per resume, sequentially. Simple,
+               results land as they complete.
+  --mode batch Submits every resume as a single Anthropic Message Batch
+               (~50% cheaper than live calls). Anthropic's SLA is "within
+               24 hours"; batches this size typically finish much sooner.
+               Safe to interrupt (Ctrl+C) and re-run the same command later
+               — it remembers the batch ID and just checks status instead
+               of resubmitting or re-billing.
 """
 
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -28,6 +39,7 @@ from kp_criteria import KP_CRITERIA, OCI_WATCHLIST
 DEFAULT_MODEL = "claude-sonnet-4-6"
 MAX_RESUME_CHARS = 24000
 SUPPORTED_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf"}
+DEFAULT_POLL_SECONDS = 30
 
 CHECKPOINT_FIELDS = [
     "file",
@@ -44,6 +56,11 @@ CHECKPOINT_FIELDS = [
     "sanction_check_pending",
     "error",
 ]
+
+
+# --------------------------------------------------------------------------
+# Resume discovery & text extraction (shared by both modes)
+# --------------------------------------------------------------------------
 
 
 def find_resumes(folder):
@@ -142,42 +159,50 @@ keys:
 """
 
 
-def call_model(client, model, prompt):
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = "".join(block.text for block in response.content if block.type == "text")
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
+# --------------------------------------------------------------------------
+# Model response parsing -> checkpoint row (shared by both modes)
+# --------------------------------------------------------------------------
+
+
+def parse_json_response(raw_text):
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
     if not match:
-        raise ValueError(f"model did not return JSON: {raw[:200]!r}")
+        raise ValueError(f"model did not return JSON: {raw_text[:200]!r}")
     return json.loads(match.group(0))
 
 
-def screen_resume(client, model, path):
+def row_from_result(file_key, result):
     row = {field: "" for field in CHECKPOINT_FIELDS}
-    row["file"] = str(path.resolve())
-    try:
-        text = extract_text(path)
-        if not text:
-            raise ValueError("no extractable text (empty or unsupported/scanned file)")
-        result = call_model(client, model, build_prompt(text, path.name))
-        row["candidate_name"] = result.get("candidate_name", "")
-        row["current_title_employer"] = result.get("current_title_employer", "")
-        row["primary_kp_category"] = result.get("primary_kp_category", "")
-        row["meets_minimums"] = result.get("meets_minimums", "")
-        row["fit_strength"] = result.get("fit_strength", "")
-        row["rationale"] = result.get("rationale", "")
-        secondary = result.get("secondary_categories") or []
-        row["secondary_categories"] = ", ".join(secondary)
-        row["multi_role_flag"] = "Y" if secondary else "N"
-        row["oci_flag"] = result.get("oci_flag", "N")
-        row["oci_reason"] = result.get("oci_reason", "")
-        row["sanction_check_pending"] = "Y"
-    except Exception as exc:  # noqa: BLE001 - any failure must not kill the run
-        row["error"] = str(exc)
+    row["file"] = file_key
+    row["candidate_name"] = result.get("candidate_name", "")
+    row["current_title_employer"] = result.get("current_title_employer", "")
+    row["primary_kp_category"] = result.get("primary_kp_category", "")
+    row["meets_minimums"] = result.get("meets_minimums", "")
+    row["fit_strength"] = result.get("fit_strength", "")
+    row["rationale"] = result.get("rationale", "")
+    secondary = result.get("secondary_categories") or []
+    row["secondary_categories"] = ", ".join(secondary)
+    row["multi_role_flag"] = "Y" if secondary else "N"
+    row["oci_flag"] = result.get("oci_flag", "N")
+    row["oci_reason"] = result.get("oci_reason", "")
+    row["sanction_check_pending"] = "Y"
     return row
+
+
+def row_from_error(file_key, message):
+    row = {field: "" for field in CHECKPOINT_FIELDS}
+    row["file"] = file_key
+    row["error"] = str(message)
+    return row
+
+
+def message_text(message):
+    return "".join(block.text for block in message.content if block.type == "text")
+
+
+# --------------------------------------------------------------------------
+# Checkpoint / Excel output (shared by both modes)
+# --------------------------------------------------------------------------
 
 
 def load_checkpoint(checkpoint_path):
@@ -189,6 +214,17 @@ def load_checkpoint(checkpoint_path):
         for row in csv.DictReader(f):
             done[row["file"]] = row
     return done
+
+
+def append_checkpoint_rows(checkpoint_path, rows):
+    checkpoint_path = Path(checkpoint_path)
+    is_new = not checkpoint_path.exists()
+    with open(checkpoint_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CHECKPOINT_FIELDS)
+        if is_new:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def write_excel(rows, out_path):
@@ -288,20 +324,227 @@ def write_excel(rows, out_path):
     wb.save(out_path)
 
 
+# --------------------------------------------------------------------------
+# Live mode: one API call per resume, sequentially
+# --------------------------------------------------------------------------
+
+
+def screen_resume_live(client, model, path):
+    file_key = str(path.resolve())
+    try:
+        text = extract_text(path)
+        if not text:
+            raise ValueError("no extractable text (empty or unsupported/scanned file)")
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": build_prompt(text, path.name)}],
+        )
+        result = parse_json_response(message_text(response))
+        return row_from_result(file_key, result)
+    except Exception as exc:  # noqa: BLE001 - any failure must not kill the run
+        return row_from_error(file_key, exc)
+
+
+def run_live_mode(client, args, resumes):
+    done = load_checkpoint(args.checkpoint)
+    total = len(resumes)
+    print(f"Screening {total} resume(s) (live mode) from {args.input}")
+
+    checkpoint_path = Path(args.checkpoint)
+    is_new = not checkpoint_path.exists()
+    with open(checkpoint_path, "a", newline="", encoding="utf-8") as ckpt_f:
+        writer = csv.DictWriter(ckpt_f, fieldnames=CHECKPOINT_FIELDS)
+        if is_new:
+            writer.writeheader()
+
+        for i, path in enumerate(resumes, start=1):
+            key = str(path.resolve())
+            if key in done:
+                print(f"[{i}/{total}] {path.name} — skipped (already in checkpoint)")
+                continue
+            print(f"[{i}/{total}] {path.name}")
+            row = screen_resume_live(client, args.model, path)
+            writer.writerow(row)
+            ckpt_f.flush()
+            done[key] = row
+            if args.sleep:
+                time.sleep(args.sleep)
+
+    write_excel(done.values(), args.out)
+    print(f"Done. Wrote {args.out} ({len(done)} candidates).")
+
+
+# --------------------------------------------------------------------------
+# Batch mode: submit everything as one Anthropic Message Batch
+# --------------------------------------------------------------------------
+
+
+def load_batch_state(state_path):
+    path = Path(state_path)
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_batch_state(state_path, state):
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def build_batch_requests(resumes, model, done):
+    """Extract text and build one batch request per not-yet-done resume.
+
+    Extraction happens locally, before submission — a resume that fails to
+    extract never reaches the API and is recorded as an error immediately.
+    """
+    requests = []
+    id_to_file = {}
+    error_rows = []
+    for path in resumes:
+        file_key = str(path.resolve())
+        if file_key in done:
+            continue
+        try:
+            text = extract_text(path)
+            if not text:
+                raise ValueError("no extractable text (empty or unsupported/scanned file)")
+        except Exception as exc:  # noqa: BLE001
+            error_rows.append(row_from_error(file_key, exc))
+            continue
+        custom_id = f"resume-{len(id_to_file):05d}"
+        id_to_file[custom_id] = file_key
+        requests.append(
+            {
+                "custom_id": custom_id,
+                "params": {
+                    "model": model,
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": build_prompt(text, path.name)}],
+                },
+            }
+        )
+    return requests, id_to_file, error_rows
+
+
+def run_batch_mode(client, args, resumes):
+    state = load_batch_state(args.batch_state)
+
+    if state is None:
+        done = load_checkpoint(args.checkpoint)
+        requests, id_to_file, error_rows = build_batch_requests(resumes, args.model, done)
+        if error_rows:
+            append_checkpoint_rows(args.checkpoint, error_rows)
+            print(f"{len(error_rows)} resume(s) failed local text extraction — logged, not billed.")
+
+        if not requests:
+            print("Nothing new to submit — all resumes already in the checkpoint.")
+            write_excel(load_checkpoint(args.checkpoint).values(), args.out)
+            print(f"Wrote {args.out}.")
+            return
+
+        print(f"Submitting {len(requests)} resume(s) as one batch...")
+        batch = client.messages.batches.create(requests=requests)
+        state = {
+            "batch_id": batch.id,
+            "id_to_file": id_to_file,
+            "model": args.model,
+            "collected": False,
+        }
+        save_batch_state(args.batch_state, state)
+        print(f"Batch submitted: {batch.id}")
+        print(
+            f"Progress is saved to {args.batch_state}. If this process is interrupted, "
+            f"re-run the exact same command — it will pick up this batch instead of "
+            f"resubmitting."
+        )
+
+    if state.get("collected"):
+        print("This batch was already collected. Nothing to do.")
+        write_excel(load_checkpoint(args.checkpoint).values(), args.out)
+        print(f"Wrote {args.out}.")
+        return
+
+    batch_id = state["batch_id"]
+    id_to_file = state["id_to_file"]
+
+    while True:
+        batch = client.messages.batches.retrieve(batch_id)
+        counts = batch.request_counts
+        print(
+            f"Batch {batch_id}: {batch.processing_status} — "
+            f"succeeded={counts.succeeded} errored={counts.errored} "
+            f"processing={counts.processing} canceled={counts.canceled} "
+            f"expired={counts.expired}"
+        )
+        if batch.processing_status == "ended":
+            break
+        if not args.wait:
+            print(
+                f"Still processing. Re-run the same command later to check again "
+                f"(polling every {args.poll_interval}s would happen automatically with --wait)."
+            )
+            return
+        time.sleep(args.poll_interval)
+
+    new_rows = []
+    for item in client.messages.batches.results(batch_id):
+        file_key = id_to_file.get(item.custom_id, item.custom_id)
+        if item.result.type == "succeeded":
+            try:
+                result = parse_json_response(message_text(item.result.message))
+                new_rows.append(row_from_result(file_key, result))
+            except Exception as exc:  # noqa: BLE001
+                new_rows.append(row_from_error(file_key, exc))
+        else:
+            detail = getattr(item.result, "error", None)
+            new_rows.append(row_from_error(file_key, f"batch request {item.result.type}: {detail}"))
+
+    append_checkpoint_rows(args.checkpoint, new_rows)
+    state["collected"] = True
+    save_batch_state(args.batch_state, state)
+
+    all_done = load_checkpoint(args.checkpoint)
+    write_excel(all_done.values(), args.out)
+    print(f"Done. Collected {len(new_rows)} result(s). Wrote {args.out} ({len(all_done)} candidates).")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="Folder of local resume files")
     parser.add_argument("--out", default="SMRC_Resume_Triage_Tracker.xlsx")
     parser.add_argument("--checkpoint", default="screen_checkpoint.csv")
     parser.add_argument("--limit", type=int, default=None, help="Only screen the first N resumes")
-    parser.add_argument("--sleep", type=float, default=0.5, help="Seconds between API calls")
-    parser.add_argument(
-        "--batch", default=None, help="Optional run label, e.g. --batch full-run (informational only)"
-    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--label", default=None, help="Optional run label, e.g. --label full-run (informational only)"
+    )
 
-    import os
+    parser.add_argument(
+        "--mode",
+        choices=["live", "batch"],
+        default="live",
+        help="live: one call per resume, sequentially. "
+        "batch: submit all resumes as one Anthropic Message Batch (~50%% cheaper, "
+        "async, completes within 24h per Anthropic's SLA — usually much sooner).",
+    )
+
+    # live mode
+    parser.add_argument("--sleep", type=float, default=0.5, help="[live] Seconds between API calls")
+
+    # batch mode
+    parser.add_argument("--batch-state", default="batch_state.json", help="[batch] Where to remember the submitted batch ID")
+    parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_SECONDS, help="[batch] Seconds between status checks while waiting")
+    parser.add_argument("--wait", dest="wait", action="store_true", default=True, help="[batch] Block and poll until the batch finishes (default)")
+    parser.add_argument("--no-wait", dest="wait", action="store_false", help="[batch] Check status once and exit if not finished; re-run later to check again")
+
+    args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("ANTHROPIC_API_KEY is not set. See RUNBOOK.md step 3.")
@@ -314,34 +557,14 @@ def main():
     if not resumes:
         sys.exit(f"No resumes found in {args.input} (looked for {sorted(SUPPORTED_EXTS)})")
 
-    done = load_checkpoint(args.checkpoint)
-    checkpoint_path = Path(args.checkpoint)
-    is_new = not checkpoint_path.exists()
+    label = f" ({args.label})" if args.label else ""
+    if label:
+        print(f"Run label:{label}")
 
-    total = len(resumes)
-    label = f" ({args.batch})" if args.batch else ""
-    print(f"Screening {total} resume(s){label} from {args.input}")
-
-    with open(checkpoint_path, "a", newline="", encoding="utf-8") as ckpt_f:
-        writer = csv.DictWriter(ckpt_f, fieldnames=CHECKPOINT_FIELDS)
-        if is_new:
-            writer.writeheader()
-
-        for i, path in enumerate(resumes, start=1):
-            key = str(path.resolve())
-            if key in done:
-                print(f"[{i}/{total}] {path.name} — skipped (already in checkpoint)")
-                continue
-            print(f"[{i}/{total}] {path.name}")
-            row = screen_resume(client, args.model, path)
-            writer.writerow(row)
-            ckpt_f.flush()
-            done[key] = row
-            if args.sleep:
-                time.sleep(args.sleep)
-
-    write_excel(done.values(), args.out)
-    print(f"Done. Wrote {args.out} ({len(done)} candidates).")
+    if args.mode == "live":
+        run_live_mode(client, args, resumes)
+    else:
+        run_batch_mode(client, args, resumes)
 
 
 if __name__ == "__main__":
