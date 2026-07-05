@@ -160,6 +160,17 @@ SharePoint libraries only:
 - This is a **first-pass triage**, not a hiring decision. Treat "Strong" primary
   matches — especially for the critical-path roles (CIO, SSO, MRM Task 2) — as a
   shortlist for human review, not a final call.
+- **Scanned/handwritten PDFs — no separate OCR step needed.** If a PDF's local
+  text extraction comes back empty or very short (a scanned page, a photocopy,
+  a page with handwritten notes or checkmarks), the script does not give up or
+  log it as unreadable. It instead sends that PDF to Claude as a native
+  document attachment instead of as extracted text — Claude reads the page
+  images directly, handwriting included, the same way a person would. You
+  don't need to install Tesseract, Adobe Acrobat OCR, or any other OCR tool;
+  just re-run the same command and previously "unreadable" PDFs will resolve
+  automatically. This only applies to `.pdf` files — a `.docx`/`.doc`/`.rtf`
+  that extracts to nothing really is empty/corrupt and still needs a human
+  look.
 
 ## Updating the criteria
 
@@ -185,6 +196,10 @@ needs to change.
   model output, etc.) are logged in the `error` column of the
   checkpoint/tracker rather than stopping the run. To retry just those, delete
   their rows from `screen_checkpoint.csv` and re-run the same command.
+- Scanned/handwritten PDFs that fall back to a document attachment (see above)
+  cost a bit more per resume than a plain-text call, since Claude is reading
+  page images rather than a short text block — negligible unless a large
+  fraction of the library is scanned.
 
 ## Files in this package
 

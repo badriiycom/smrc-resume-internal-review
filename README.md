@@ -28,6 +28,11 @@ lets you stop and resume a long run without re-billing or losing progress.
 No admin rights on your machine to install Python? See the runbook's
 no-install setup using the Python embeddable package.
 
+Scanned PDFs and pages with handwritten notes don't need a separate OCR
+step — if local text extraction comes back empty, the script hands the PDF
+to Claude directly as a document attachment instead of extracted text (see
+the runbook's "How the scoring works" section).
+
 Resumes, the checkpoint CSV, and the output `.xlsx` are excluded from git via
 `.gitignore` — this repo holds the tool, not candidate data.
 

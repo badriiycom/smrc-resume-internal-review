@@ -14,9 +14,16 @@ Two modes:
                Safe to interrupt (Ctrl+C) and re-run the same command later
                — it remembers the batch ID and just checks status instead
                of resubmitting or re-billing.
+
+Scanned/handwritten PDFs: if local text extraction comes back empty or too
+short (a scanned page, a photocopy, handwritten annotations), the script
+does not give up — it sends the PDF itself to Claude as a native document
+attachment instead of extracted text. Claude reads the page images directly
+(including handwriting), so no separate OCR software is required.
 """
 
 import argparse
+import base64
 import csv
 import json
 import os
@@ -40,6 +47,12 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 MAX_RESUME_CHARS = 24000
 SUPPORTED_EXTS = {".pdf", ".docx", ".txt", ".doc", ".rtf"}
 DEFAULT_POLL_SECONDS = 30
+
+# Below this many extracted characters, a PDF is treated as scanned/image-only
+# (or otherwise text-extraction-hostile) and sent to Claude as a document
+# attachment instead of as embedded text. A real resume, even a short one,
+# extracts to well more than this; a blank/scanned page extracts to ~0.
+OCR_FALLBACK_MIN_CHARS = 100
 
 CHECKPOINT_FIELDS = [
     "file",
@@ -101,7 +114,7 @@ def _convert_with_libreoffice(path):
         return out.read_text(errors="ignore") if out.exists() else ""
 
 
-def build_prompt(resume_text, filename):
+def build_prompt(resume_text, filename, attached_as_document=False):
     role_blocks = []
     for code, role in KP_CRITERIA.items():
         knockouts = "\n".join(f"  - {item}" for item in role["knockouts"])
@@ -115,14 +128,22 @@ def build_prompt(resume_text, filename):
     oci_text = "\n".join(f"  - {item}" for item in OCI_WATCHLIST)
     role_codes = ", ".join(f'"{c}"' for c in KP_CRITERIA)
 
+    if attached_as_document:
+        resume_section = (
+            f"RESUME FILENAME: {filename}\n"
+            "RESUME: attached above as a PDF document. Local text extraction failed or returned "
+            "too little text to score — this is likely a scanned page, a photocopy, or a page "
+            "with handwritten notes/annotations — so read the attached pages directly, including "
+            "any handwritten text, checkmarks, or margin notes, the same way you would read an "
+            "image."
+        )
+    else:
+        resume_section = f"RESUME FILENAME: {filename}\nRESUME TEXT:\n\"\"\"\n{resume_text}\n\"\"\""
+
     return f"""You are screening a resume for the CMS Supplemental Medical Review Contractor
 (SMRC) recompete against Commence's eight Key Personnel (KP) role checklists below.
 
-RESUME FILENAME: {filename}
-RESUME TEXT:
-\"\"\"
-{resume_text}
-\"\"\"
+{resume_section}
 
 ROLE CHECKLISTS:
 {roles_text}
@@ -157,6 +178,38 @@ keys:
   "sanction_check_pending": true
 }}
 """
+
+
+def build_message_content(path, text):
+    """Build the `content` value for a screening request for this resume.
+
+    Normally this is just the prompt string with resume_text embedded. But
+    for a PDF where local extraction failed or returned too little text
+    (scanned page, photocopy, handwritten notes), it instead returns a
+    content list with the raw PDF attached as a native document block ahead
+    of the prompt — Claude reads the pages directly, no OCR software needed.
+
+    Raises ValueError only when there is truly nothing to send (non-PDF
+    files with no extractable text at all — .txt/.docx/.doc/.rtf don't have
+    a "scanned page" failure mode, so an empty result there is a real
+    extraction failure, not something a document attachment can fix).
+    """
+    if path.suffix.lower() == ".pdf" and len(text) < OCR_FALLBACK_MIN_CHARS:
+        pdf_b64 = base64.standard_b64encode(path.read_bytes()).decode("ascii")
+        return [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": pdf_b64,
+                },
+            },
+            {"type": "text", "text": build_prompt("", path.name, attached_as_document=True)},
+        ]
+    if not text:
+        raise ValueError("no extractable text (empty or unsupported file)")
+    return build_prompt(text, path.name)
 
 
 # --------------------------------------------------------------------------
@@ -333,12 +386,11 @@ def screen_resume_live(client, model, path):
     file_key = str(path.resolve())
     try:
         text = extract_text(path)
-        if not text:
-            raise ValueError("no extractable text (empty or unsupported/scanned file)")
+        content = build_message_content(path, text)
         response = client.messages.create(
             model=model,
             max_tokens=1024,
-            messages=[{"role": "user", "content": build_prompt(text, path.name)}],
+            messages=[{"role": "user", "content": content}],
         )
         result = parse_json_response(message_text(response))
         return row_from_result(file_key, result)
@@ -396,8 +448,12 @@ def save_batch_state(state_path, state):
 def build_batch_requests(resumes, model, done):
     """Extract text and build one batch request per not-yet-done resume.
 
-    Extraction happens locally, before submission — a resume that fails to
-    extract never reaches the API and is recorded as an error immediately.
+    Extraction happens locally, before submission. A resume with genuinely
+    no extractable text (empty .txt/.docx/.doc/.rtf) never reaches the API
+    and is recorded as an error immediately. A PDF with too little text
+    (scanned page, photocopy, handwriting) is NOT skipped — it is still
+    submitted, with the raw PDF attached as a document instead of text, so
+    Claude reads the pages directly.
     """
     requests = []
     id_to_file = {}
@@ -408,8 +464,7 @@ def build_batch_requests(resumes, model, done):
             continue
         try:
             text = extract_text(path)
-            if not text:
-                raise ValueError("no extractable text (empty or unsupported/scanned file)")
+            content = build_message_content(path, text)
         except Exception as exc:  # noqa: BLE001
             error_rows.append(row_from_error(file_key, exc))
             continue
@@ -421,7 +476,7 @@ def build_batch_requests(resumes, model, done):
                 "params": {
                     "model": model,
                     "max_tokens": 1024,
-                    "messages": [{"role": "user", "content": build_prompt(text, path.name)}],
+                    "messages": [{"role": "user", "content": content}],
                 },
             }
         )
